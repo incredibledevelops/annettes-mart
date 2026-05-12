@@ -5,22 +5,9 @@ from functools import wraps
 import json, os, csv, io
 
 app = Flask(__name__)
-
-# Use environment variable for secret key in production
-app.secret_key = os.environ.get('SECRET_KEY', 'annettes-mart-secret-2024')
-
-# Database configuration - support multiple databases via environment variable
-database_url = os.environ.get('DATABASE_URL', 'sqlite:///annettes_mart.db')
-
-# Fix for Render's PostgreSQL URLs (they use postgres:// but SQLAlchemy needs postgresql://)
-if database_url and database_url.startswith('postgres://'):
-    database_url = database_url.replace('postgres://', 'postgresql://', 1)
-
-app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+app.secret_key = 'annettes-mart-secret-2024'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///annettes_mart.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
-# Disable debug mode in production
-app.debug = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
 
 db = SQLAlchemy(app)
 
@@ -36,6 +23,8 @@ class User(db.Model):
     password   = db.Column(db.String(100), nullable=False)
     role       = db.Column(db.String(50), default='Cashier')
     status     = db.Column(db.String(20), default='Active')
+    # JSON-encoded list of allowed section keys e.g. ["dashboard","sales"]
+    # If NULL, no restriction (all sections allowed for Admin)
     permissions = db.Column(db.Text, nullable=True)
 
 
@@ -95,7 +84,7 @@ class Sale(db.Model):
     type          = db.Column(db.String(20), default='Retail')
     subtotal      = db.Column(db.Float, default=0)
     discount      = db.Column(db.Float, default=0)
-    discount_type = db.Column(db.String(10), default='percent')
+    discount_type = db.Column(db.String(10), default='percent')  # 'percent' or 'fixed'
     tax           = db.Column(db.Float, default=0)
     total         = db.Column(db.Float, default=0)
     cost          = db.Column(db.Float, default=0)
@@ -104,7 +93,7 @@ class Sale(db.Model):
     change_due    = db.Column(db.Float, default=0)
     notes         = db.Column(db.Text)
     items_json    = db.Column(db.Text, default='[]')
-    status        = db.Column(db.String(20), default='Completed')
+    status        = db.Column(db.String(20), default='Completed')  # Completed, Voided, Credit
 
 
 class Purchase(db.Model):
@@ -161,6 +150,7 @@ def login_required(f):
     return decorated
 
 def permission_required(section):
+    """Decorator to check if current user has access to a section."""
     def decorator(f):
         @wraps(f)
         def decorated(*args, **kwargs):
@@ -169,6 +159,7 @@ def permission_required(section):
             user = User.query.get(session['user_id'])
             if not user:
                 return jsonify({'error': 'Unauthorized'}), 401
+            # Admin always has full access
             if user.role == 'Admin':
                 return f(*args, **kwargs)
             if user.permissions:
@@ -246,6 +237,7 @@ def seed_data():
         ))
         db.session.commit()
 
+    # Seed categories
     if Category.query.count() == 0:
         cats = [
             Category(name='Beverages', description='Drinks and liquids', color='#2d6a4f'),
@@ -300,17 +292,16 @@ def seed_data():
         db.session.commit()
 
     if Customer.query.count() == 0:
-        today = date.today().isoformat()
         customers = [
             Customer(name='Kwame Asante', phone='+233 24 123 4567', email='kwame@email.com',
                      type='Wholesale', address='Tema', total_purchases=1450,
-                     credit_limit=5000, credit_used=0, created_date=today),
+                     credit_limit=5000, credit_used=0, created_date=date.today().isoformat()),
             Customer(name='Abena Mensah', phone='+233 55 987 6543', email='',
                      type='Retail', address='Accra Central', total_purchases=340,
-                     credit_limit=500, credit_used=0, created_date=today),
+                     credit_limit=500, credit_used=0, created_date=date.today().isoformat()),
             Customer(name='Kofi Boateng', phone='+233 20 456 7890', email='kofi@biz.com',
                      type='Both', address='Kumasi', total_purchases=2800,
-                     credit_limit=10000, credit_used=0, created_date=today),
+                     credit_limit=10000, credit_used=0, created_date=date.today().isoformat()),
         ]
         db.session.add_all(customers)
         db.session.commit()
@@ -343,6 +334,7 @@ def seed_data():
                 db.session.add(sale)
         db.session.commit()
 
+    # Default settings
     defaults = {
         'name': "Annette's Mart",
         'address': '123 Market Street, Accra, Ghana',
@@ -369,14 +361,12 @@ def seed_data():
 
 
 # =============================================================================
-# ROUTES
+# AUTH ROUTES
 # =============================================================================
 
 @app.route('/')
 def index():
-    # Read the HTML file
-    with open('index.html', 'r', encoding='utf-8') as f:
-        return f.read()
+    return render_template('index.html')
 
 @app.route('/api/login', methods=['POST'])
 def login():
@@ -390,7 +380,6 @@ def login():
         session['user_name'] = user.name
         session['user_role'] = user.role
         perms = json.loads(user.permissions) if user.permissions else None
-        session.permanent = True
         return jsonify({
             'ok': True, 'name': user.name, 'role': user.role,
             'permissions': perms
@@ -632,6 +621,7 @@ def add_customer():
 def get_customer(cid):
     c = Customer.query.get_or_404(cid)
     data = customer_to_dict(c)
+    # Attach purchase history
     sales = Sale.query.filter_by(customer_id=cid).order_by(Sale.id.desc()).all()
     data['purchases'] = [sale_to_dict(s) for s in sales]
     return jsonify(data)
@@ -723,6 +713,7 @@ def add_supplier():
 def get_supplier(sid):
     s = Supplier.query.get_or_404(sid)
     data = supplier_to_dict(s)
+    # Attach purchase history
     purchases = Purchase.query.filter_by(supplier_id=sid).order_by(Purchase.id.desc()).all()
     data['purchases'] = [purchase_to_dict(p) for p in purchases]
     return jsonify(data)
@@ -827,11 +818,13 @@ def create_sale():
     change_due  = max(0, amount_paid - total)
     sale_status = d.get('status', 'Completed')
 
+    # Deduct stock
     for item in items:
         p = Product.query.get(item['productId'])
         if p:
             p.stock = max(0, p.stock - int(item['qty']))
 
+    # Update customer
     cust_id   = d.get('customerId')
     cust_name = 'Walk-in'
     if cust_id:
@@ -875,10 +868,12 @@ def void_sale(sid):
     s = Sale.query.get_or_404(sid)
     if s.status == 'Voided':
         return jsonify({'error': 'Already voided'}), 400
+    # Restore stock
     for item in json.loads(s.items_json or '[]'):
         p = Product.query.get(item.get('productId'))
         if p:
             p.stock += int(item.get('qty', 0))
+    # Reverse customer totals
     if s.customer_id:
         cust = Customer.query.get(s.customer_id)
         if cust:
@@ -927,7 +922,7 @@ def add_purchase():
 
     if status == 'Received' and prod:
         prod.stock += qty
-        prod.buy_price = cost
+        prod.buy_price = cost  # update buy price to latest
 
     if supp:
         supp.total_supplied = (supp.total_supplied or 0) + total
@@ -944,6 +939,7 @@ def update_purchase(pid):
     old_status = p.status
     new_status = d.get('status', p.status)
 
+    # If status changes to Received and was not before, add stock
     if new_status == 'Received' and old_status != 'Received':
         prod = Product.query.get(p.product_id)
         if prod:
@@ -1038,11 +1034,11 @@ def get_expense_categories():
 # =============================================================================
 
 ROLE_PERMISSIONS = {
-    'Admin':       None,
-    'Manager':     ['dashboard','inventory','categories','sales','customers','suppliers','purchases','expenses','analytics','export','import'],
+    'Admin':       None,  # all access
+    'Manager':     ['dashboard','inventory','sales','customers','suppliers','purchases','expenses','analytics','export','import'],
     'Cashier':     ['dashboard','sales','customers'],
-    'Stock Keeper':['dashboard','inventory','categories','purchases','suppliers'],
-    'Accountant':  ['dashboard','analytics','expenses','export','sales','reports'],
+    'Stock Keeper':['dashboard','inventory','purchases','suppliers'],
+    'Accountant':  ['dashboard','analytics','expenses','export','sales'],
 }
 
 @app.route('/api/users', methods=['GET'])
@@ -1068,13 +1064,14 @@ def add_user():
     if User.query.filter_by(username=username).first():
         return jsonify({'error': 'Username already exists'}), 409
 
-    custom_perms = d.get('permissions')
+    # Determine permissions
+    custom_perms = d.get('permissions')  # list or None
     if custom_perms is not None:
         perms_json = json.dumps(custom_perms)
     elif role in ROLE_PERMISSIONS and ROLE_PERMISSIONS[role] is not None:
         perms_json = json.dumps(ROLE_PERMISSIONS[role])
     else:
-        perms_json = None
+        perms_json = None  # Admin: no restriction
 
     u = User(name=name, username=username, password=password, role=role,
              status=d.get('status', 'Active'), permissions=perms_json)
@@ -1158,6 +1155,7 @@ def dashboard():
     low_stock  = Product.query.filter(Product.stock <= lowstock_threshold).all()
     recent     = Sale.query.order_by(Sale.id.desc()).limit(6).all()
 
+    # Weekly trend
     weekly = []
     for i in range(6, -1, -1):
         d_str     = (date.today() - timedelta(days=i)).isoformat()
@@ -1174,6 +1172,7 @@ def dashboard():
         s.total for s in Sale.query.filter_by(type='Retail').filter(Sale.status != 'Voided').all()
     )
 
+    # Today's expenses
     today_expenses = sum(
         e.amount for e in Expense.query.filter_by(date=today_str).all()
     )
@@ -1229,6 +1228,7 @@ def analytics():
     net_profit   = gross_profit - total_exp
     margin       = (gross_profit / total_rev * 100) if total_rev else 0
 
+    # Monthly (last 6 months)
     monthly = []
     for m in range(5, -1, -1):
         ref = date.today().replace(day=1)
@@ -1247,6 +1247,7 @@ def analytics():
             'expenses': sum(e.amount for e in me),
         })
 
+    # Category performance
     cat_map = {}
     for s in all_sales:
         for item in json.loads(s.items_json or '[]'):
@@ -1254,6 +1255,7 @@ def analytics():
             cat = p.category if p else 'Other'
             cat_map[cat] = cat_map.get(cat, 0) + float(item['price']) * int(item['qty'])
 
+    # Top products
     prod_map = {}
     for s in all_sales:
         for item in json.loads(s.items_json or '[]'):
@@ -1267,11 +1269,13 @@ def analytics():
         v['profit'] = v['rev'] - v['cost']
     top = sorted(prod_map.values(), key=lambda x: x['rev'], reverse=True)[:10]
 
+    # Payment method breakdown
     pay_map = {}
     for s in all_sales:
         pm = s.payment_method or 'Cash'
         pay_map[pm] = pay_map.get(pm, 0) + s.total
 
+    # Expense by category
     exp_cat_map = {}
     for e in all_expenses:
         exp_cat_map[e.category] = exp_cat_map.get(e.category, 0) + e.amount
@@ -1295,6 +1299,7 @@ def analytics():
 @app.route('/api/reports/sales-summary', methods=['GET'])
 @login_required
 def report_sales_summary():
+    """Day-by-day sales report for a date range."""
     date_from = request.args.get('date_from', (date.today() - timedelta(days=30)).isoformat())
     date_to   = request.args.get('date_to', date.today().isoformat())
     sales = Sale.query.filter(
@@ -1320,6 +1325,7 @@ def report_sales_summary():
 @app.route('/api/reports/inventory-valuation', methods=['GET'])
 @login_required
 def report_inventory_valuation():
+    """Inventory valuation report."""
     products = Product.query.all()
     rows = []
     for p in products:
@@ -1428,12 +1434,13 @@ def export_data(dtype):
 
 
 # =============================================================================
-# DATA MANAGEMENT – IMPORT
+# DATA MANAGEMENT – IMPORT (bulk endpoints already exist above)
 # =============================================================================
 
 @app.route('/api/import/full', methods=['POST'])
 @login_required
 def import_full():
+    """Import a full JSON backup."""
     d = request.json or {}
     imported = {}
 
@@ -1515,12 +1522,13 @@ def reset_all():
 
 
 # =============================================================================
-# DATABASE CONNECTION SETTINGS
+# DATABASE CONNECTION SETTINGS (switch between SQLite / MySQL / PostgreSQL)
 # =============================================================================
 
 @app.route('/api/settings/db-test', methods=['POST'])
 @login_required
 def test_db_connection():
+    """Test a database connection string without applying it."""
     d = request.json or {}
     db_type = d.get('dbType', 'sqlite')
     try:
@@ -1556,5 +1564,4 @@ with app.app_context():
     seed_data()
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(debug=True, port=5000)
